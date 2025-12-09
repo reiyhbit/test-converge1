@@ -463,7 +463,7 @@
         let currentStreamUrl = '';
         let currentChannelIndex = 0;
         
-        // Playlist URLs - PINALITAN ANG CONVERGE URL DITO
+        // Playlist URLs
         const PLAYLIST_URLS = {
             converge: 'https://converse.nathcreqtives.com/playlist.m3u?token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJyZWl5aDEwMjY5NCIsImV4cCI6MTc2NTg1Njc0MH0.6hmppZKNycvU17S2latBLhBPM2wpyHgksWrWRtQp9bM',
             cignal: 'https://reiyhbit.github.io/iptv/playlist.m3u'
@@ -501,7 +501,7 @@
                 // Create Player instance
                 player = new shaka.Player(video);
                 
-                // Configure player for both DRM types
+                // Configure player for better error handling
                 player.configure({
                     drm: {
                         servers: {},
@@ -511,7 +511,11 @@
                         bufferingGoal: 30,
                         rebufferingGoal: 15,
                         bufferBehind: 30,
-                        lowLatencyMode: true
+                        lowLatencyMode: true,
+                        failureCallback: function(error) {
+                            console.error('Streaming failure:', error);
+                            return shaka.util.Error.Severity.RECOVERABLE;
+                        }
                     }
                 });
                 
@@ -537,17 +541,37 @@
             }
         }
         
-        // Parse M3U playlist
+        // Improved M3U playlist parser
         async function parseM3UPlaylist(url, playlistType) {
             try {
                 console.log(`Parsing ${playlistType} playlist from: ${url}`);
-                const response = await fetch(url);
+                
+                // Add timeout to fetch
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+                
+                const response = await fetch(url, {
+                    signal: controller.signal,
+                    headers: {
+                        'Accept': 'application/vnd.apple.mpegurl, application/x-mpegurl',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                });
+                
+                clearTimeout(timeoutId);
                 
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
                 
                 const text = await response.text();
+                
+                // Check if response is valid M3U
+                if (!text.includes('#EXTM3U')) {
+                    console.warn('Response does not appear to be a valid M3U playlist');
+                    // Try to parse anyway
+                }
+                
                 const lines = text.split('\n');
                 const channels = [];
                 let currentChannel = null;
@@ -569,11 +593,12 @@
                         const groupTitle = extractAttribute(line, 'group-title');
                         
                         currentChannel = {
-                            name: name.trim(),
+                            name: name.trim() || `Channel ${channels.length + 1}`,
                             tvgId: tvgId || '',
                             tvgLogo: tvgLogo || '',
                             groupTitle: groupTitle || 'General',
-                            keys: {}
+                            keys: {},
+                            originalLine: line
                         };
                         
                     } else if (line.startsWith('#KODIPROP:inputstream.adaptive.license_type=')) {
@@ -595,6 +620,16 @@
                     } else if (line && !line.startsWith('#') && currentChannel) {
                         // This is the stream URL
                         currentChannel.url = line.trim();
+                        
+                        // Add token to URL if it's Converge playlist
+                        if (playlistType === 'converge' && url.includes('token=')) {
+                            const urlObj = new URL(url);
+                            const token = urlObj.searchParams.get('token');
+                            if (token && !currentChannel.url.includes('token=')) {
+                                const separator = currentChannel.url.includes('?') ? '&' : '?';
+                                currentChannel.url = `${currentChannel.url}${separator}token=${token}`;
+                            }
+                        }
                         
                         // Add ClearKey data if available
                         if (currentKeys.keyId && currentKeys.key) {
@@ -625,13 +660,77 @@
                 }
                 
                 console.log(`Parsed ${channels.length} channels from ${playlistType} playlist`);
+                
+                // If no channels found but playlist has URLs, try alternative parsing
+                if (channels.length === 0 && text.includes('http')) {
+                    console.log('Trying alternative parsing...');
+                    return tryAlternativeParsing(text, playlistType, url);
+                }
+                
                 return channels;
                 
             } catch (error) {
                 console.error(`Error parsing ${playlistType} playlist:`, error);
-                showError(`Failed to load ${playlistType} playlist: ${error.message}`);
+                
+                // Try to get more specific error message
+                let errorMsg = error.message;
+                if (error.name === 'AbortError') {
+                    errorMsg = 'Request timeout - server not responding';
+                } else if (error.message.includes('Failed to fetch')) {
+                    errorMsg = 'Network error - check CORS or server availability';
+                }
+                
+                showError(`Failed to load ${playlistType} playlist: ${errorMsg}`);
                 return [];
             }
+        }
+        
+        // Alternative parsing method
+        function tryAlternativeParsing(text, playlistType, originalUrl) {
+            const channels = [];
+            const lines = text.split('\n');
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                
+                if (line.startsWith('#EXTINF:')) {
+                    const nameMatch = line.match(/#EXTINF:.*?,(.*)/);
+                    const name = nameMatch ? nameMatch[1].trim() : `Channel ${channels.length + 1}`;
+                    
+                    // Look for next non-empty, non-comment line as URL
+                    for (let j = i + 1; j < lines.length; j++) {
+                        const nextLine = lines[j].trim();
+                        if (nextLine && !nextLine.startsWith('#') && nextLine.startsWith('http')) {
+                            
+                            let url = nextLine;
+                            
+                            // Add token if needed
+                            if (playlistType === 'converge' && originalUrl.includes('token=')) {
+                                const urlObj = new URL(originalUrl);
+                                const token = urlObj.searchParams.get('token');
+                                if (token && !url.includes('token=')) {
+                                    const separator = url.includes('?') ? '&' : '?';
+                                    url = `${url}${separator}token=${token}`;
+                                }
+                            }
+                            
+                            channels.push({
+                                name: name,
+                                url: url,
+                                groupTitle: 'General',
+                                tvgId: '',
+                                tvgLogo: '',
+                                keys: {}
+                            });
+                            
+                            console.log(`Alt found channel: ${name} - ${url}`);
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            return channels;
         }
         
         // Extract attribute from line
@@ -649,12 +748,15 @@
         // Load playlist
         async function loadPlaylist(playlistType) {
             updateStatus(`Loading ${playlistType} playlist...`);
+            showLoading(true, `Fetching ${playlistType} playlist...`);
             
             try {
                 const channels = await parseM3UPlaylist(PLAYLIST_URLS[playlistType], playlistType);
+                showLoading(false);
                 
                 if (channels.length === 0) {
                     updateStatus(`No channels found in ${playlistType} playlist`);
+                    showError(`No channels found in ${playlistType} playlist. Check the playlist URL.`);
                     return false;
                 }
                 
@@ -674,14 +776,16 @@
                     currentChannelIndex = 0;
                     setTimeout(() => {
                         selectChannelByIndex(0, playlistType);
-                    }, 1000);
+                    }, 500);
                 }
                 
                 return true;
                 
             } catch (error) {
                 console.error('Error loading playlist:', error);
+                showLoading(false);
                 updateStatus(`Error loading playlist: ${error.message}`);
+                showError(`Failed to load ${playlistType}: ${error.message}`);
                 return false;
             }
         }
@@ -730,29 +834,53 @@
             selectChannelByIndex(newIndex, currentPlaylist);
         }
         
-        // Load stream with DRM
+        // Load stream with better error handling
         async function loadStream(streamUrl, channelName, playlistType) {
             try {
+                console.log(`Attempting to load: ${channelName}`);
+                console.log(`Stream URL: ${streamUrl}`);
+                console.log(`Playlist type: ${playlistType}`);
+                
                 showLoading(true, `Loading ${channelName}...`);
                 currentStreamUrl = streamUrl;
                 
                 hideError();
                 
+                // Stop current playback
+                if (player) {
+                    try {
+                        await player.unload();
+                    } catch (e) {
+                        console.log('Error unloading player:', e);
+                    }
+                }
+                
                 if (playlistType === 'converge') {
-                    console.log('Loading Converge stream with Widevine DRM');
+                    console.log('Loading Converge stream');
                     
-                    // Configure Widevine DRM
-                    player.configure({
-                        drm: {
-                            servers: {
-                                'com.widevine.alpha': DRM_CONFIG.converge.servers['com.widevine.alpha']
-                            },
-                            clearKeys: {}
-                        }
-                    });
+                    // Try different approaches for Converge
+                    const video = document.getElementById('video');
                     
-                    await player.load(streamUrl);
-                    updateStatus(`Now playing: ${channelName} (Widevine DRM)`);
+                    // First try with Shaka Player
+                    try {
+                        player.configure({
+                            drm: {
+                                servers: {
+                                    'com.widevine.alpha': DRM_CONFIG.converge.servers['com.widevine.alpha']
+                                },
+                                clearKeys: {}
+                            }
+                        });
+                        
+                        await player.load(streamUrl);
+                        updateStatus(`Now playing: ${channelName}`);
+                        
+                    } catch (shakaError) {
+                        console.log('Shaka failed, trying HLS.js...', shakaError);
+                        
+                        // Fall back to HLS.js
+                        tryAlternativePlayback(streamUrl, channelName);
+                    }
                     
                 } else if (playlistType === 'cignal') {
                     console.log('Loading Cignal stream with ClearKey DRM');
@@ -767,29 +895,6 @@
                             drm: {
                                 servers: {},
                                 clearKeys: clearKeyConfig.clearKeys
-                            }
-                        });
-                        
-                        // Setup license request handler for ClearKey
-                        player.getNetworkingEngine().registerRequestFilter(async (type, request) => {
-                            if (type === shaka.net.NetworkingEngine.RequestType.LICENSE) {
-                                console.log('Processing ClearKey license request');
-                                
-                                const license = {
-                                    keys: []
-                                };
-                                
-                                Object.entries(clearKeyConfig.clearKeys).forEach(([keyId, key]) => {
-                                    license.keys.push({
-                                        kty: 'oct',
-                                        kid: keyId,
-                                        k: key
-                                    });
-                                });
-                                
-                                request.headers['Content-Type'] = 'application/json';
-                                request.body = shaka.util.StringUtils.toUTF8(JSON.stringify(license));
-                                request.allowCrossSiteCredentials = true;
                             }
                         });
                         
@@ -813,22 +918,24 @@
             } catch (error) {
                 console.error('Error loading stream:', error);
                 
-                if (playlistType === 'cignal') {
-                    showError('Trying alternative playback method...');
-                    setTimeout(() => {
-                        tryAlternativePlayback(streamUrl, channelName);
-                    }, 1000);
-                } else {
-                    showError(`Failed to load stream: ${error.message}`);
-                }
+                // Try alternative playback for any error
+                showError(`Error: ${error.message || 'Unknown error'}. Trying alternative playback...`);
+                setTimeout(() => {
+                    tryAlternativePlayback(streamUrl, channelName);
+                }, 1000);
+                
             } finally {
-                showLoading(false);
+                setTimeout(() => {
+                    showLoading(false);
+                }, 500);
             }
         }
         
         // Alternative playback method
         function tryAlternativePlayback(streamUrl, channelName) {
             const video = document.getElementById('video');
+            
+            console.log('Trying alternative playback for:', channelName);
             
             // Detach Shaka Player
             if (player) {
@@ -843,33 +950,55 @@
             video.src = '';
             video.load();
             
-            // Try HLS.js
-            if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-                console.log('Trying HLS.js playback');
-                const hls = new Hls({
-                    enableWorker: true,
-                    lowLatencyMode: true
-                });
+            // First check if HLS.js is available
+            if (typeof Hls !== 'undefined') {
+                console.log('HLS.js is available, trying it...');
                 
-                hls.loadSource(streamUrl);
-                hls.attachMedia(video);
-                
-                hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                    video.play().catch(e => {
-                        console.log('Auto-play prevented:', e);
+                if (Hls.isSupported()) {
+                    console.log('Trying HLS.js playback');
+                    const hls = new Hls({
+                        enableWorker: true,
+                        lowLatencyMode: true,
+                        liveSyncDurationCount: 3,
+                        liveMaxLatencyDurationCount: 10,
+                        debug: false
                     });
-                    updateStatus(`Now playing: ${channelName} (HLS.js)`);
-                });
-                
-                hls.on(Hls.Events.ERROR, (event, data) => {
-                    console.error('HLS.js error:', data);
-                    if (data.fatal) {
-                        hls.destroy();
-                        tryNativeHLS(streamUrl, channelName);
-                    }
-                });
-                
-                return;
+                    
+                    hls.loadSource(streamUrl);
+                    hls.attachMedia(video);
+                    
+                    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                        console.log('HLS manifest parsed');
+                        video.play().catch(e => {
+                            console.log('Auto-play prevented:', e);
+                            updateStatus(`Loaded: ${channelName} - Tap to play`);
+                        });
+                        updateStatus(`Now playing: ${channelName} (HLS.js)`);
+                        hideError();
+                    });
+                    
+                    hls.on(Hls.Events.ERROR, (event, data) => {
+                        console.error('HLS.js error:', data);
+                        if (data.fatal) {
+                            switch(data.type) {
+                                case Hls.ErrorTypes.NETWORK_ERROR:
+                                    console.log('Network error, trying again...');
+                                    hls.startLoad();
+                                    break;
+                                case Hls.ErrorTypes.MEDIA_ERROR:
+                                    console.log('Media error, recovering...');
+                                    hls.recoverMediaError();
+                                    break;
+                                default:
+                                    hls.destroy();
+                                    tryNativeHLS(streamUrl, channelName);
+                                    break;
+                            }
+                        }
+                    });
+                    
+                    return;
+                }
             }
             
             // Try native HLS
@@ -880,24 +1009,34 @@
         function tryNativeHLS(streamUrl, channelName) {
             const video = document.getElementById('video');
             
+            console.log('Trying native HLS playback');
+            
             if (video.canPlayType('application/vnd.apple.mpegurl') || 
                 video.canPlayType('application/x-mpegURL')) {
-                console.log('Trying native HLS playback');
+                console.log('Browser supports native HLS');
                 video.src = streamUrl;
                 video.load();
                 
-                video.play().then(() => {
-                    updateStatus(`Now playing: ${channelName} (Native HLS)`);
-                }).catch(e => {
-                    console.log('Auto-play prevented:', e);
-                    updateStatus(`Loaded: ${channelName} - Tap to play`);
-                });
+                const playPromise = video.play();
+                
+                if (playPromise !== undefined) {
+                    playPromise.then(() => {
+                        updateStatus(`Now playing: ${channelName} (Native HLS)`);
+                        hideError();
+                    }).catch(e => {
+                        console.log('Auto-play prevented:', e);
+                        updateStatus(`Loaded: ${channelName} - Tap to play`);
+                        hideError();
+                    });
+                }
             } else {
-                showError('Your browser does not support HLS playback');
+                console.log('Browser does not support HLS');
+                showError('Your browser does not support HLS playback. Try Chrome, Firefox, or Safari.');
+                updateStatus(`Cannot play: ${channelName} - Browser not supported`);
             }
         }
         
-        // Update channel list UI - SIMPLIFIED
+        // Update channel list UI
         function updateChannelList(playlistType) {
             const channelList = document.getElementById('channel-list');
             const channels = playlistType === 'converge' ? convergeChannels : cignalChannels;
@@ -907,7 +1046,7 @@
             if (channels.length === 0) {
                 channelList.innerHTML = `
                     <div class="channel-item" style="text-align: center; opacity: 0.7; justify-content: center;">
-                        No channels found
+                        No channels found in ${playlistType} playlist
                     </div>
                 `;
                 document.getElementById('channel-count').textContent = '0 channels';
@@ -936,7 +1075,6 @@
                     </div>
                 `;
                 
-                // SIMPLE CLICK HANDLER
                 channelElement.onclick = () => {
                     // Remove active from all
                     document.querySelectorAll('.channel-item').forEach(item => {
@@ -955,10 +1093,12 @@
                 channelList.appendChild(channelElement);
             });
             
-            // Auto-select first
+            // Auto-select first if not already playing
             if (channelList.children.length > 0) {
                 const firstChannel = channelList.children[0];
-                firstChannel.classList.add('active');
+                if (!document.querySelector('.channel-item.active')) {
+                    firstChannel.classList.add('active');
+                }
             }
         }
         
@@ -997,7 +1137,6 @@
             const errorElement = document.getElementById('error-message');
             errorElement.textContent = message;
             errorElement.style.display = 'block';
-            setTimeout(hideError, 5000);
         }
         
         // Hide error
@@ -1019,17 +1158,19 @@
         function onPlayerError(event) {
             console.error('Player error:', event.detail);
             
-            if (event.detail.code === 6007 || event.detail.code === 6016) {
-                if (currentPlaylist === 'cignal' && currentStreamUrl) {
-                    showError('DRM error. Trying alternative playback...');
-                    setTimeout(() => {
-                        tryAlternativePlayback(currentStreamUrl, getCurrentChannelName());
-                    }, 1000);
-                } else {
-                    showError(`DRM Error: ${event.detail.message}`);
-                }
-            } else {
-                showError(`Playback error: ${event.detail.message}`);
+            let errorMessage = 'Playback error';
+            if (event.detail && event.detail.message) {
+                errorMessage = event.detail.message;
+            }
+            
+            showError(`Player error: ${errorMessage}`);
+            
+            // Try alternative playback for DRM errors
+            if (event.detail && event.detail.code && 
+                (event.detail.code === 6007 || event.detail.code === 6016)) {
+                setTimeout(() => {
+                    tryAlternativePlayback(currentStreamUrl, getCurrentChannelName());
+                }, 2000);
             }
         }
         
@@ -1053,14 +1194,18 @@
         
         // Initialize when page loads
         document.addEventListener('DOMContentLoaded', async () => {
-            // Add HLS.js
+            // Add HLS.js with error handling
             const hlsScript = document.createElement('script');
             hlsScript.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest';
+            hlsScript.onerror = () => {
+                console.warn('Failed to load HLS.js, will use native playback');
+            };
             document.head.appendChild(hlsScript);
             
             // Initialize player
             const playerInitialized = await initPlayer();
             if (!playerInitialized) {
+                showError('Failed to initialize video player. Please refresh the page.');
                 return;
             }
             
@@ -1111,9 +1256,10 @@
             // Auto-load Cignal playlist on startup
             setTimeout(async () => {
                 console.log('Auto-loading Cignal playlist...');
-                const loaded = await loadPlaylist('cignal');
-                if (loaded) {
-                    console.log('Cignal playlist loaded successfully');
+                try {
+                    await loadPlaylist('cignal');
+                } catch (error) {
+                    console.error('Failed to auto-load Cignal:', error);
                 }
             }, 1000);
             
@@ -1155,6 +1301,16 @@
                 const video = document.getElementById('video');
                 video.style.objectFit = document.fullscreenElement ? 'cover' : 'contain';
             });
+            
+            // Handle video errors
+            const video = document.getElementById('video');
+            video.addEventListener('error', (e) => {
+                console.error('Video element error:', e);
+                showError('Video playback error. Trying alternative method...');
+                setTimeout(() => {
+                    tryAlternativePlayback(currentStreamUrl, getCurrentChannelName());
+                }, 1000);
+            });
         });
         
         // Page visibility
@@ -1163,7 +1319,7 @@
             if (document.hidden) {
                 video.pause();
             } else if (currentPlaylist) {
-                video.play().catch(e => console.log('Auto-play prevented'));
+                video.play().catch(e => console.log('Auto-play prevented after visibility change'));
             }
         });
     </script>
